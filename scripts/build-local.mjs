@@ -92,7 +92,7 @@ if (!TIMELINE || !STATE) {
 async function fetchSteering() {
   if (!STEERING_ENABLED) return [];
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/novel_steering?status=eq.pending&order=created_at.asc&select=id,note`,
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/novel_steering?status=eq.pending&novel_id=eq.hunter&order=created_at.asc&select=id,note`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
     if (!res.ok) { console.warn(`개입 fetch 실패 HTTP ${res.status}`); return []; }
     return await res.json();
