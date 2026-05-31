@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Continue'
 # 작업 스케줄러는 최소 PATH로 실행 — node/git/claude 경로 명시.
 $env:Path = "C:\Program Files\nodejs;C:\Program Files\Git\cmd;C:\Users\myh43\AppData\Roaming\npm;$env:Path"
 
-$repo = Join-Path ([Environment]::GetFolderPath('Desktop')) 'work\13_웹소설'
+$repo = Join-Path ([Environment]::GetFolderPath('Desktop')) 'work\14_웹소설'
 Set-Location $repo
 $log = Join-Path $repo 'daily.log'
 
