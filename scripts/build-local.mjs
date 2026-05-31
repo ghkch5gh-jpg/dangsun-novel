@@ -59,6 +59,11 @@ const WORLD = await readSafe("canon/world.md");
 const TIMELINE = await readSafe("canon/timeline.md");
 const PREMISE = await readSafe("canon/premise.md");  // 이 작품의 한 끗(차별점) — 매 화 유지·강화
 const ARC = await readSafe("canon/arc.md");          // 시즌1 100화 아크 — 페이싱·결말 방향
+const REVIEW = await readSafe("review.md");          // 편집자 리뷰 — 다음 화 생성 지침 자동 반영(자가발전)
+const reviewGuide = (() => {
+  const m = REVIEW.match(/##\s*다음 화 생성 지침\s*([\s\S]*?)(?:\n##\s|$)/);
+  return m ? m[1].trim() : "";
+})();
 const SERIES_TITLE = "회귀했는데 고인물이 너무 많다";
 const TARGET = 100;
 const ACT =
@@ -160,6 +165,7 @@ ${lastBody || "(없음)"}
 ${steeringText ? `# ⚡ 독자(작가) 개입 — 이번 화에 반드시 반영
 ${steeringText}
 → 자연스럽게 녹이되 캐논·연속성은 유지.` : "# 독자 개입\n(없음 — state.md의 '다음 화 방향'으로 자연스럽게 이어가세요.)"}
+${reviewGuide ? `# 📝 편집 지침 (최근 리뷰 반영 — 반드시 적용)\n${reviewGuide}\n` : ""}
 ${retryNote ? `\n# ⚠️ 직전 시도가 다음 모순을 일으킴 — 반드시 피해서 다시 쓰세요\n${retryNote}\n` : ""}
 ${STYLE}
 

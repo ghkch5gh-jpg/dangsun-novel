@@ -20,6 +20,10 @@ git pull --quiet origin main *>> $log
 node scripts/build-local.mjs *>> $log
 if ($LASTEXITCODE -ne 0) { Log "generator failed (exit $LASTEXITCODE)"; exit 1 }
 
+# 편집자 리뷰 갱신 — 오늘 회차까지 반영해 다음 화 생성 지침을 새로 뽑는다(자가발전). 실패해도 무시.
+node scripts/review.mjs *>> $log
+if ($LASTEXITCODE -ne 0) { Log "review failed (exit $LASTEXITCODE) — skip" }
+
 git add -A *>> $log
 git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) {
