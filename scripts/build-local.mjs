@@ -15,7 +15,7 @@ import { spawn } from "node:child_process";
 
 const DRY_RUN = process.env.DRY_RUN === "1";
 const NO_VERIFY = process.env.NO_VERIFY === "1";
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "sonnet";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "opus"; // 품질 우선(캐릭터·문장 디테일). sonnet 으로 내리려면 CLAUDE_MODEL=sonnet
 
 // ── .env 로더 ─────────────────────────────────────────────────
 async function loadDotEnv() {
@@ -57,6 +57,7 @@ const lastBody = lastFile ? bodyOf(await readSafe(lastFile)) : "";
 // ── 락드 canon 로드 ───────────────────────────────────────────
 const WORLD = await readSafe("canon/world.md");
 const TIMELINE = await readSafe("canon/timeline.md");
+const PREMISE = await readSafe("canon/premise.md");  // 이 작품의 한 끗(차별점) — 매 화 유지·강화
 let charFiles = [];
 try { charFiles = (await readdir("canon/characters")).filter((f) => f.endsWith(".md")); } catch {}
 const characters = [];
@@ -98,12 +99,15 @@ const steering = await fetchSteering();
 const steeringText = steering.map((s, i) => `${i + 1}. ${String(s.note).trim()}`).join("\n");
 
 // ── 정통 문법 ─────────────────────────────────────────────────
-const STYLE = `# 한국 웹소설 정통 문법 (반드시 준수)
-- 분량: 본문 2500~3500자. 하루치 한 화로 5분 안에 읽히게.
-- 시점·톤: 주인공 밀착(1인칭 또는 3인칭 제한). 짧고 빠른 문장, 대사 중심. 묘사 최소, 사건·감정 위주.
-- 구조: 도입 → 전개 → **절단신공**(마지막 1~2문장은 강한 훅/반전/위기로 끊기).
-- 사이다: 주인공이 미래 지식·실력으로 앞서나가는 통쾌함을 매 화 최소 1회.
-- 연속성 최우선: 아래 캐논(타임라인·세계관·인물)과 **한 줄도 모순 금지**. 미래지식 날짜·인물 정체·소유 아이템은 캐논 그대로.
+const STYLE = `# 한국 웹소설 정통 문법 — 재미가 1순위 (반드시 준수)
+- **첫 3줄 후킹**: 도입부 이탈률이 전부다. 첫 1~3문장에서 즉시 끌어당겨라(위기/반전/욕망/사이다 예고). 풍경·분위기 묘사로 천천히 시작 금지.
+- **사이다 ≥ 1**: 매 화 반드시 1회 이상, 주인공이 한 발 앞서거나 한 방 먹이는 **확실한 카타르시스**. 답답함(고구마)을 길게 끌지 말 것.
+- **절단신공**: 마지막 1~2문장은 강한 훅/반전/위기로 끊어 다음 화를 못 참게.
+- **문체**: 짧고 빠른 문장. **대사 비중 높게**, 내적 독백 활용. 묘사는 최소(사건·감정·행동 위주). 미문보다 가독성·속도.
+- **차별점 유지(THE HOOK)**: 아래 'premise(한 끗)'를 매 화 살려라. 평범한 "회귀자=미래 다 앎 무쌍" 클리셰로 절대 회귀하지 말 것.
+- 분량: 본문 2500~3500자. 5분 안에 읽히게.
+- 시점: 주인공 밀착(1인칭 또는 3인칭 제한).
+- 연속성 최우선: 캐논(프리미스·타임라인·세계관·인물)과 **한 줄도 모순 금지**. 미래지식 날짜·인물 정체·소유 아이템은 캐논 그대로.
 - 금지: 작가 메타발언, 회차 요약식 서술, "다음 화에 계속" 안내문. 본문은 순수 소설 텍스트만.`;
 
 // ── 생성 프롬프트 빌더 ────────────────────────────────────────
@@ -111,6 +115,9 @@ function buildPrompt(retryNote) {
   return `**중요 — *채팅 응답* 형식. 도구·검색·파일시스템 금지. 응답은 한 덩어리 JSON만. 첫 글자 \`{\`. 인사·보고문 금지.**
 
 당신은 한국 웹소설 전문 작가입니다. 연재 중인 작품의 **${nextEp}화**를, 아래 캐논과 직전 화에 **완벽히 연속**되게 이어 쓰고, 캐논 갱신분을 함께 반환합니다.
+
+# 🔥 이 작품의 한 끗 — 매 화 반드시 유지·강화 (클리셰 탈출의 핵심)
+${PREMISE || "(없음)"}
 
 # 🔒 캐논 — 절대 모순 금지 (수정 불가, 읽기 전용)
 ## 타임라인(미래지식)
@@ -202,20 +209,56 @@ async function verify(body, threadsNew) {
   return { contradictions: Array.isArray(v.contradictions) ? v.contradictions : [], ok: v.ok !== false };
 }
 
-// ── 생성 + (하드 모순 시) 1회 재생성 ──────────────────────────
-let data = null, verdict = null;
+// ── 재미 채점 (3차 호출) — 후킹/사이다/절단/속도/차별점 ────────
+async function funScore(body) {
+  if (NO_VERIFY) return { ok: true, scores: {}, fix: "" };
+  const fPrompt = `**채팅 응답. 도구·검색 금지. JSON 하나만, 첫 글자 \`{\`.**
+당신은 냉정한 웹소설 편집자입니다. 아래 [새 화]를 양산형 웹소설 독자 기준으로 1~5점 채점하세요(후하게 X).
+- hook: 첫 3줄이 즉시 끌어당기는가 (풍경/분위기로 느리게 시작하면 낮게)
+- cider: 확실한 카타르시스/사이다가 1회 이상 있는가 (고구마만 있으면 낮게)
+- cliff: 마지막이 다음 화를 못 참게 끊는가
+- pace: 짧은 문장·대사 비중·속도감 (묘사 과다면 낮게)
+- distinct: 이 작품의 한 끗(미래지식이 어긋나는 회귀물)이 살아 있는가, 평범 클리셰 무쌍으로 흐르지 않는가
+
+# 이 작품의 한 끗\n${PREMISE}
+# 새 화 본문\n${body}
+
+# 출력
+{ "hook":n, "cider":n, "cliff":n, "pace":n, "distinct":n, "verdict": "pass" 또는 "weak", "fix": "약하면 다음 시도에 줄 구체 처방 1~2줄, 좋으면 빈 문자열" }
+판정: hook<3 또는 cider<3 또는 distinct<3 또는 합계<16 이면 "weak".`;
+  let raw;
+  try { raw = await callClaude(fPrompt); } catch (e) { console.warn(`재미 채점 호출 실패: ${e.message} — 통과 처리`); return { ok: true, scores: {}, fix: "" }; }
+  const f = parseJson(raw, "재미");
+  if (!f) return { ok: true, scores: {}, fix: "" };
+  const s = { hook: +f.hook || 0, cider: +f.cider || 0, cliff: +f.cliff || 0, pace: +f.pace || 0, distinct: +f.distinct || 0 };
+  const sum = s.hook + s.cider + s.cliff + s.pace + s.distinct;
+  const weak = f.verdict === "weak" || s.hook < 3 || s.cider < 3 || s.distinct < 3 || sum < 16;
+  return { ok: !weak, scores: s, sum, fix: String(f.fix || "").trim() };
+}
+
+// ── 생성 + (하드 모순 OR 재미 미달 시) 1회 재생성 ─────────────
+let data = null, verdict = null, fun = null;
 for (let attempt = 0; attempt < 2; attempt++) {
-  const retryNote = attempt === 0 ? "" : (verdict?.contradictions || []).filter((c) => c.severity === "hard").map((c) => `- [${c.type}] ${c.detail}`).join("\n");
-  console.log(attempt === 0 ? "생성 호출..." : "하드 모순 → 1회 재생성...");
+  let retryNote = "";
+  if (attempt > 0) {
+    const hardNotes = (verdict?.contradictions || []).filter((c) => c.severity === "hard").map((c) => `- [모순/${c.type}] ${c.detail}`);
+    if (fun && !fun.ok) hardNotes.push(`- [재미] 점수 ${JSON.stringify(fun.scores)} — ${fun.fix || "후킹·사이다·차별점을 강화하라"}`);
+    retryNote = hardNotes.join("\n");
+  }
+  console.log(attempt === 0 ? "생성 호출..." : "재생성(모순/재미 보강)...");
   const raw = await callClaude(buildPrompt(retryNote));
   const d = parseJson(raw, "생성");
   if (!d || !d.body_md || String(d.body_md).trim().length < 400) { console.error("본문 부실 — 재시도"); continue; }
-  verdict = await verify(String(d.body_md).trim(), String(d.threads_md || THREADS));
+  const body = String(d.body_md).trim();
+  [verdict, fun] = await Promise.all([verify(body, String(d.threads_md || THREADS)), funScore(body)]);
   const hard = verdict.contradictions.filter((c) => c.severity === "hard");
-  console.log(`  연속성: 모순 ${verdict.contradictions.length} (하드 ${hard.length})` + (verdict.contradictions.length ? " — " + verdict.contradictions.map((c) => `[${c.severity}/${c.type}]`).join(" ") : ""));
+  console.log(`  연속성: 모순 ${verdict.contradictions.length}(하드 ${hard.length}) · 재미: ${fun.ok ? "pass" : "weak"} ${JSON.stringify(fun.scores)}${fun.sum ? " 합 " + fun.sum : ""}`);
   data = d;
-  if (!hard.length) break;
-  if (attempt === 1) console.warn("⚠️ 재생성 후에도 하드 모순 잔존 — 일단 발행하고 로그로 남김(옵시디언/개입으로 보정 권장):\n" + hard.map((c) => `  - [${c.type}] ${c.detail}`).join("\n"));
+  if (!hard.length && fun.ok) break;
+  if (attempt === 1) {
+    if (hard.length) console.warn("⚠️ 하드 모순 잔존 — 발행 후 옵시디언/개입으로 보정 권장:\n" + hard.map((c) => `  - [${c.type}] ${c.detail}`).join("\n"));
+    if (!fun.ok) console.warn(`⚠️ 재미 미달 잔존(합 ${fun.sum}) — 그래도 발행. 개입으로 방향 보정 권장.`);
+  }
 }
 if (!data) { console.error("생성 실패"); process.exit(1); }
 
