@@ -1,35 +1,28 @@
 #!/usr/bin/env node
-// 웹소설 자동연재 생성기 — story-bible(누적 설정) + 직전 화 + 독자 개입(Supabase) → claude -p → 다음 화.
-// dangsun.kr/novel 에서 렌더링. 한국 웹소설 정통 문법.
+// 웹소설 자동연재 생성기 v2 — 락드 canon(옵시디언 볼트) + append-only 갱신 + 연속성 체크.
+// dangsun.kr/novel 렌더. 한국 웹소설 정통 문법.
 //
-//   DRY_RUN=1 : 프롬프트만 출력 (claude 호출 안 함)
-//   FORCE=1   : 오늘 회차가 이미 있어도 강제로 다음 화 생성
-//   CLAUDE_MODEL=opus : 품질 ↑ (기본 sonnet)
+// 연속성 설계 (drift 방지):
+//   - canon/timeline.md, canon/world.md, canon/characters/*.md = 🔒 락드 → append만, 덮어쓰기 없음(전언게임 차단)
+//   - canon/threads.md, state.md = 런닝 → 매 화 전체 갱신.  synopsis.md = 화당 1줄 append.
+//   - 생성 직후 '연속성 체크' 2차 claude 호출이 새 화를 락드 canon·이전 떡밥과 대조 → 하드 모순 시 1회 재생성.
 //
-// 환경변수(개입 기능용, 없으면 개입 없이 진행):
-//   NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-//   → 없으면 .env 파일(이 repo 루트, gitignore됨)에서 읽음.
+//   DRY_RUN=1 : 프롬프트만   FORCE=1 : 오늘 회차 있어도 강제   CLAUDE_MODEL=opus   NO_VERIFY=1 : 연속성 체크 끔
+//   환경(개입용, 없으면 개입 없이): NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (.env 가능)
 
-import { readFile, writeFile, readdir, access } from "node:fs/promises";
+import { readFile, writeFile, readdir, access, mkdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 
 const DRY_RUN = process.env.DRY_RUN === "1";
+const NO_VERIFY = process.env.NO_VERIFY === "1";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "sonnet";
 
-// ── .env 로더 (있으면) ─────────────────────────────────────────
+// ── .env 로더 ─────────────────────────────────────────────────
 async function loadDotEnv() {
-  try {
-    await access(".env");
-  } catch {
-    return;
-  }
-  const txt = await readFile(".env", "utf8");
-  for (const line of txt.split(/\r?\n/)) {
+  try { await access(".env"); } catch { return; }
+  for (const line of (await readFile(".env", "utf8")).split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-    if (!m) continue;
-    const key = m[1];
-    let val = m[2].replace(/^["']|["']$/g, "");
-    if (!process.env[key]) process.env[key] = val;
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
   }
 }
 await loadDotEnv();
@@ -38,202 +31,200 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const STEERING_ENABLED = !!(SUPABASE_URL && SUPABASE_KEY);
 
+const readSafe = async (p) => { try { return await readFile(p, "utf8"); } catch { return ""; } };
+
 // ── 날짜 / 회차 번호 ───────────────────────────────────────────
 const now = new Date();
 const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 const dateStr = kst.toISOString().slice(0, 10);
 
 const allMd = (await readdir(".")).filter((f) => /^\d{4}-\d{2}-\d{2}_\d+\.md$/.test(f));
-const epNums = allMd
-  .map((f) => parseInt((f.match(/_(\d+)\.md$/) || [])[1] || "0", 10))
-  .sort((a, b) => a - b);
+const epNums = allMd.map((f) => parseInt((f.match(/_(\d+)\.md$/) || [])[1] || "0", 10)).sort((a, b) => a - b);
 const lastEp = epNums.length ? epNums[epNums.length - 1] : 0;
 
-// 오늘 이미 생성했는지 — 같은 날짜 prefix 파일 존재 여부
-const todayExists = allMd.some((f) => f.startsWith(`${dateStr}_`));
-if (todayExists && process.env.FORCE !== "1") {
+if (allMd.some((f) => f.startsWith(`${dateStr}_`)) && process.env.FORCE !== "1") {
   console.log(`${dateStr} 회차 이미 존재 — 종료 (FORCE=1로 강제 추가)`);
   process.exit(0);
 }
-
 const nextEp = lastEp + 1;
 const slug = `${dateStr}_${String(nextEp).padStart(3, "0")}`;
-const isFirst = nextEp === 1;
 
-// ── 직전 화 본문 (최대 2화) ───────────────────────────────────
-function bodyOf(md) {
-  const m = md.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n([\s\S]*)$/);
-  return (m ? m[1] : md).trim();
-}
-const priorFiles = allMd.sort().reverse().slice(0, 2);
-const priorBodies = [];
-for (const f of priorFiles.reverse()) {
-  const num = parseInt((f.match(/_(\d+)\.md$/) || [])[1] || "0", 10);
-  priorBodies.push(`[${num}화]\n${bodyOf(await readFile(f, "utf8"))}`);
+// ── 직전 화 본문 ──────────────────────────────────────────────
+const bodyOf = (md) => { const m = md.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n([\s\S]*)$/); return (m ? m[1] : md).replace(/<\/?div[^>]*>/g, "").trim(); };
+const lastFile = allMd.sort().reverse()[0];
+const lastBody = lastFile ? bodyOf(await readSafe(lastFile)) : "";
+
+// ── 락드 canon 로드 ───────────────────────────────────────────
+const WORLD = await readSafe("canon/world.md");
+const TIMELINE = await readSafe("canon/timeline.md");
+let charFiles = [];
+try { charFiles = (await readdir("canon/characters")).filter((f) => f.endsWith(".md")); } catch {}
+const characters = [];
+for (const f of charFiles) characters.push({ name: f.replace(/\.md$/, ""), md: await readSafe(`canon/characters/${f}`) });
+const CHARS_FULL = characters.map((c) => c.md).join("\n\n");
+
+// ── 런닝 상태 로드 ────────────────────────────────────────────
+const THREADS = await readSafe("canon/threads.md");
+const STATE = await readSafe("state.md");
+const SYNOPSIS = await readSafe("synopsis.md");
+const synopsisTail = SYNOPSIS.split(/\r?\n/).filter((l) => l.trim().startsWith("-")).slice(-12).join("\n");
+
+if (!TIMELINE || !STATE) {
+  console.error("canon/timeline.md 또는 state.md 가 없음 — canon 시드를 먼저 만들어야 함");
+  process.exit(1);
 }
 
-// ── 스토리 바이블 (누적 설정) ─────────────────────────────────
-let bible = "";
-try {
-  bible = await readFile("story-bible.md", "utf8");
-} catch {
-  bible = "";
-}
-
-// ── 독자 개입 노트 (Supabase) ─────────────────────────────────
+// ── 독자 개입 (Supabase) ──────────────────────────────────────
 async function fetchSteering() {
   if (!STEERING_ENABLED) return [];
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/novel_steering?status=eq.pending&order=created_at.asc&select=id,note,created_at`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    if (!res.ok) {
-      console.warn(`개입 노트 fetch 실패: HTTP ${res.status}`);
-      return [];
-    }
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/novel_steering?status=eq.pending&order=created_at.asc&select=id,note`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    if (!res.ok) { console.warn(`개입 fetch 실패 HTTP ${res.status}`); return []; }
     return await res.json();
-  } catch (e) {
-    console.warn(`개입 노트 fetch 오류: ${e.message}`);
-    return [];
-  }
+  } catch (e) { console.warn(`개입 fetch 오류: ${e.message}`); return []; }
 }
-async function markApplied(ids, episodeSlug) {
+async function markApplied(ids) {
   if (!STEERING_ENABLED || !ids.length) return;
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/novel_steering?id=in.(${ids.join(",")})`,
-      {
-        method: "PATCH",
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          "Content-Type": "application/json",
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({
-          status: "applied",
-          applied_episode: episodeSlug,
-          applied_at: new Date().toISOString(),
-        }),
-      }
-    );
-    if (!res.ok) console.warn(`개입 노트 applied 처리 실패: HTTP ${res.status}`);
-  } catch (e) {
-    console.warn(`개입 노트 applied 오류: ${e.message}`);
-  }
+    await fetch(`${SUPABASE_URL}/rest/v1/novel_steering?id=in.(${ids.join(",")})`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=minimal" },
+      body: JSON.stringify({ status: "applied", applied_episode: slug, applied_at: new Date().toISOString() }),
+    });
+  } catch (e) { console.warn(`개입 applied 오류: ${e.message}`); }
 }
-
 const steering = await fetchSteering();
-const steeringText = steering.length
-  ? steering.map((s, i) => `${i + 1}. ${String(s.note).trim()}`).join("\n")
-  : "";
+const steeringText = steering.map((s, i) => `${i + 1}. ${String(s.note).trim()}`).join("\n");
 
-// ── 시드(1화 전용) ────────────────────────────────────────────
-const SEED = `# 시드 설정 (1화 생성용 — 한국 웹소설 정통: 현대 회귀 헌터물)
-
-- 주인공: 강시혁(姜時赫), 34세. 세계 최강 길드 '백야'의 잡일꾼 포터(짐꾼). 각성 능력은 최하급, 늘 무시당하며 살았다.
-- 사건: 마지막 게이트 '심연'의 공략 중, 길드장의 버림을 받아 미끼로 던져져 죽는다. 눈을 뜨니 모든 게이트가 처음 열리던 10년 전, 26세의 자신.
-- 무기: 미래의 기억 — 어떤 게이트에서 무엇이 나오는지, 어떤 아이템이 어디 있는지, 누가 언제 배신하는지 전부 안다.
-- 목표: 이번 생엔 최강 헌터가 되어, 10년 뒤 인류를 멸망시킬 '심연 게이트'를 막는다. 그리고 자신을 버린 자들에게 갚아준다.
-- 톤: 1인칭 또는 주인공 밀착 3인칭. 사이다·성장·복수. 절단신공(매 화 끝 강한 훅).`;
-
-// ── 프롬프트 ──────────────────────────────────────────────────
+// ── 정통 문법 ─────────────────────────────────────────────────
 const STYLE = `# 한국 웹소설 정통 문법 (반드시 준수)
 - 분량: 본문 2500~3500자. 하루치 한 화로 5분 안에 읽히게.
-- 시점·톤: 주인공 밀착(1인칭 또는 3인칭 제한). 짧고 빠른 문장, 대사 중심. 묘사는 최소, 사건과 감정 위주.
-- 구조: 도입(상황) → 전개(갈등·정보·행동) → **절단신공**(마지막 1~2문장은 강한 훅/반전/위기로 끊어 다음 화를 궁금하게).
-- 사이다: 주인공이 미래 지식·실력으로 한 방 먹이거나 앞서나가는 통쾌함을 매 화 최소 1회.
-- 떡밥: 매 화 새 떡밥 하나는 심거나 회수. 인물·설정은 story-bible과 어긋나면 안 됨(연속성 최우선).
-- 금지: 작가의 메타발언, 회차 요약식 서술, "다음 화에 계속" 같은 직접 안내문. 본문은 순수 소설 텍스트만.`;
+- 시점·톤: 주인공 밀착(1인칭 또는 3인칭 제한). 짧고 빠른 문장, 대사 중심. 묘사 최소, 사건·감정 위주.
+- 구조: 도입 → 전개 → **절단신공**(마지막 1~2문장은 강한 훅/반전/위기로 끊기).
+- 사이다: 주인공이 미래 지식·실력으로 앞서나가는 통쾌함을 매 화 최소 1회.
+- 연속성 최우선: 아래 캐논(타임라인·세계관·인물)과 **한 줄도 모순 금지**. 미래지식 날짜·인물 정체·소유 아이템은 캐논 그대로.
+- 금지: 작가 메타발언, 회차 요약식 서술, "다음 화에 계속" 안내문. 본문은 순수 소설 텍스트만.`;
 
-let prompt;
-if (isFirst) {
-  prompt = `**중요 — 이 요청은 *채팅 응답* 형식입니다. 도구·검색·파일시스템 사용 금지. 응답은 한 덩어리 JSON만. 첫 글자부터 \`{\` 로 시작. 인사·보고문 금지.**
+// ── 생성 프롬프트 빌더 ────────────────────────────────────────
+function buildPrompt(retryNote) {
+  return `**중요 — *채팅 응답* 형식. 도구·검색·파일시스템 금지. 응답은 한 덩어리 JSON만. 첫 글자 \`{\`. 인사·보고문 금지.**
 
-당신은 한국 웹소설 전문 작가입니다. 아래 시드 설정으로 **1화**를 씁니다.
+당신은 한국 웹소설 전문 작가입니다. 연재 중인 작품의 **${nextEp}화**를, 아래 캐논과 직전 화에 **완벽히 연속**되게 이어 쓰고, 캐논 갱신분을 함께 반환합니다.
 
-${SEED}
+# 🔒 캐논 — 절대 모순 금지 (수정 불가, 읽기 전용)
+## 타임라인(미래지식)
+${TIMELINE}
+## 세계관·규칙
+${WORLD}
+## 인물
+${CHARS_FULL}
 
-${STYLE}
-
-# 출력 스키마 (이대로만)
-\`\`\`
-{
-  "title": "1화. 제목",
-  "edition_note": "이 화 한 줄 소개 (~60자, 스포 없이 후킹)",
-  "body_md": "본문 (마크다운, 2500~3500자, 대사·장면 포함, 절단신공으로 끝)",
-  "recap": "이 화 핵심 한 줄 (다음 화 생성 참고용)",
-  "bible": "스토리 바이블 전문 (마크다운). 아래 6개 섹션 필수:\\n## 로그라인\\n## 주요 인물 (이름·정체·관계·현재상황)\\n## 세계관·규칙 (게이트/각성/길드 등 설정)\\n## 진행 중 떡밥 (열린 것/회수된 것)\\n## 현재 상태 (1화 끝 시점의 장소·상황·주인공 목표)\\n## 다음 화 예고 (작가 메모, 어디로 이어질지)"
-}
-\`\`\``;
-} else {
-  prompt = `**중요 — 이 요청은 *채팅 응답* 형식입니다. 도구·검색·파일시스템 사용 금지. 응답은 한 덩어리 JSON만. 첫 글자부터 \`{\` 로 시작. 인사·보고문 금지.**
-
-당신은 한국 웹소설 전문 작가입니다. 연재 중인 작품의 **${nextEp}화**를 씁니다. 아래 스토리 바이블과 직전 화에 **완벽히 연속**되게 이어 쓰세요.
-
-# 스토리 바이블 (지금까지의 누적 설정 — 절대 어기지 말 것)
-${bible || "(바이블 없음 — 직전 화에서 추론)"}
+# 런닝 상태 (이번 화로 갱신할 대상)
+## 현재 상태(state.md)
+${STATE}
+## 떡밥(threads.md)
+${THREADS}
+## 최근 시놉시스
+${synopsisTail}
 
 # 직전 화 본문
-${priorBodies.join("\n\n---\n\n") || "(없음)"}
+${lastBody || "(없음)"}
 
-${steeringText ? `# ⚡ 독자(작가)의 개입 지시 — 이번 화에 반드시 반영
+${steeringText ? `# ⚡ 독자(작가) 개입 — 이번 화에 반드시 반영
 ${steeringText}
-
-→ 위 지시를 자연스럽게 이번 화 전개에 녹이세요. 단, 기존 설정·연속성은 유지하면서.` : "# 독자 개입\n(이번 화는 개입 없음 — 바이블의 '다음 화 예고' 방향으로 자연스럽게 이어가세요.)"}
-
+→ 자연스럽게 녹이되 캐논·연속성은 유지.` : "# 독자 개입\n(없음 — state.md의 '다음 화 방향'으로 자연스럽게 이어가세요.)"}
+${retryNote ? `\n# ⚠️ 직전 시도가 다음 모순을 일으킴 — 반드시 피해서 다시 쓰세요\n${retryNote}\n` : ""}
 ${STYLE}
 
 # 출력 스키마 (이대로만)
 \`\`\`
 {
   "title": "${nextEp}화. 제목",
-  "edition_note": "이 화 한 줄 소개 (~60자, 스포 없이 후킹)",
-  "body_md": "본문 (마크다운, 2500~3500자, 대사·장면 포함, 절단신공으로 끝)",
-  "recap": "이 화 핵심 한 줄 (다음 화 생성 참고용)",
-  "bible": "갱신된 스토리 바이블 전문 (마크다운, 위 바이블을 이번 화 내용 반영해 업데이트). 6개 섹션 유지:\\n## 로그라인\\n## 주요 인물\\n## 세계관·규칙\\n## 진행 중 떡밥\\n## 현재 상태\\n## 다음 화 예고"
+  "edition_note": "이 화 한 줄 소개(~60자, 스포 없이 후킹)",
+  "body_md": "본문 마크다운 2500~3500자, 절단신공으로 끝",
+  "synopsis_line": "이 화를 1~2문장으로 (시놉시스 누적용, 인물은 그대로 표기)",
+  "state_md": "state.md 전체 새 내용 (회차/장소/시각/소지/신체/즉시목표/장기목표 + '## 다음 화 방향')",
+  "threads_md": "threads.md 전체 새 내용 (## 열림 / ## 회수). 회수된 떡밥은 회수로 옮기고, 열린 떡밥은 누락 없이 유지+추가",
+  "new_characters": [{"name":"새인물이름","content":"---\\nstatus: 생존\\n---\\n# 이름\\n정체 1~2문장. [[관련인물]] 위키링크 사용. 끝에 '## 변화 로그' 섹션."}],
+  "character_logs": [{"name":"강시혁","line":"이 화에서 그 인물에게 일어난 변화 한 줄"}],
+  "world_appends": ["이번 화에서 새로 확정된 세계관 규칙(있을 때만, 보통 빈 배열)"],
+  "timeline_appends": ["새로 드러난 '원래 역사' 미래사건(드묾, 보통 빈 배열)"]
 }
-\`\`\``;
+\`\`\`
+주의: new_characters 의 name 은 기존 인물(${characters.map((c) => c.name).join(", ")})과 겹치면 안 됨(그건 character_logs 로). 캐논 인물 정체는 절대 바꾸지 말 것.`;
 }
 
-console.log(`회차: ${nextEp}화 (${slug}) · 개입 ${steering.length}건 · 모델 ${CLAUDE_MODEL}`);
-console.log(`Prompt: ${(Buffer.byteLength(prompt, "utf8") / 1024).toFixed(1)} KB`);
-if (DRY_RUN) {
-  console.log("=== DRY RUN ===\n" + prompt.slice(0, 3000) + `\n...(전체 ${prompt.length}자)`);
-  process.exit(0);
-}
+console.log(`회차: ${nextEp}화 (${slug}) · 개입 ${steering.length}건 · 인물 ${characters.length} · 모델 ${CLAUDE_MODEL}`);
+const prompt0 = buildPrompt("");
+console.log(`Prompt: ${(Buffer.byteLength(prompt0, "utf8") / 1024).toFixed(1)} KB`);
+if (DRY_RUN) { console.log("=== DRY RUN ===\n" + prompt0.slice(0, 3500) + `\n...(전체 ${prompt0.length}자)`); process.exit(0); }
 
 // ── claude 호출 ───────────────────────────────────────────────
 function callClaude(promptText) {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--output-format", "text", "--allowedTools", "", "--model", CLAUDE_MODEL];
-    console.log(`claude -p (${CLAUDE_MODEL}) 호출...`);
     const child = spawn("claude", args, { stdio: ["pipe", "pipe", "inherit"], shell: true });
     let out = "";
     const timer = setTimeout(() => { child.kill(); reject(new Error("타임아웃 5분")); }, 5 * 60 * 1000);
     child.stdout.on("data", (d) => (out += d.toString()));
     child.on("error", (e) => { clearTimeout(timer); reject(e); });
-    child.on("close", (code) => { clearTimeout(timer); code === 0 ? resolve(out) : reject(new Error(`claude exit ${code}`)); });
-    child.stdin.write(promptText);
-    child.stdin.end();
+    child.on("close", (c) => { clearTimeout(timer); c === 0 ? resolve(out) : reject(new Error(`claude exit ${c}`)); });
+    child.stdin.write(promptText); child.stdin.end();
   });
 }
+const parseJson = (raw, kind) => {
+  const m = raw.match(/```json\s*([\s\S]*?)\s*```/) || raw.match(/\{[\s\S]*\}/) || raw.match(/\[[\s\S]*\]/);
+  if (!m) { console.error(`${kind} JSON 미발견:`, raw.slice(0, 500)); return null; }
+  try { return JSON.parse(m[1] ?? m[0]); } catch (e) { console.error(`${kind} 파싱 실패:`, e.message, raw.slice(0, 500)); return null; }
+};
 
-const raw = await callClaude(prompt);
-const jm = raw.match(/```json\s*([\s\S]*?)\s*```/) || raw.match(/\{[\s\S]*\}/);
-if (!jm) { console.error("JSON 미발견:", raw.slice(0, 600)); process.exit(1); }
-let data;
-try { data = JSON.parse(jm[1] ?? jm[0]); } catch (e) { console.error("파싱 실패:", e.message, "\n", raw.slice(0, 600)); process.exit(1); }
+// ── 연속성 체크 (2차 호출) ────────────────────────────────────
+async function verify(body, threadsNew) {
+  if (NO_VERIFY) return { contradictions: [], ok: true };
+  const vPrompt = `**채팅 응답. 도구·검색 금지. JSON 하나만, 첫 글자 \`{\`.**
+당신은 웹소설 연속성 감수자입니다. 아래 [새 화]가 [캐논]·[이전 떡밥]과 모순되는지 점검하세요.
+하드 모순(작품을 깨뜨림): 타임라인 날짜/사건 위반, 인물 정체·이름·생사 모순, 미래지식과 어긋남, 열려 있던 떡밥이 설명 없이 사라짐.
+소프트(사소): 어조·표현 차이 등.
 
-const title = String(data.title || `${nextEp}화`).trim();
-const note = String(data.edition_note || "").replaceAll('"', "'").trim();
-const bodyMd = String(data.body_md || "").trim();
-if (bodyMd.length < 400) { console.error("본문이 너무 짧음 — 생성 실패로 간주"); process.exit(1); }
+# 캐논
+## 타임라인\n${TIMELINE}\n## 세계관\n${WORLD}\n## 인물\n${CHARS_FULL}
+# 이전 떡밥(이번 화 전)\n${THREADS}
+# 새 떡밥(이번 화가 제시)\n${threadsNew}
+# 새 화 본문\n${body}
+
+# 출력
+{ "contradictions": [ {"type":"timeline|character|item|thread|world","detail":"무엇이 어떻게 모순인지","severity":"hard|soft"} ], "ok": true 또는 false(하드 있으면 false) }`;
+  let raw;
+  try { raw = await callClaude(vPrompt); } catch (e) { console.warn(`연속성 체크 호출 실패: ${e.message} — 통과 처리`); return { contradictions: [], ok: true }; }
+  const v = parseJson(raw, "검증");
+  if (!v) return { contradictions: [], ok: true };
+  return { contradictions: Array.isArray(v.contradictions) ? v.contradictions : [], ok: v.ok !== false };
+}
+
+// ── 생성 + (하드 모순 시) 1회 재생성 ──────────────────────────
+let data = null, verdict = null;
+for (let attempt = 0; attempt < 2; attempt++) {
+  const retryNote = attempt === 0 ? "" : (verdict?.contradictions || []).filter((c) => c.severity === "hard").map((c) => `- [${c.type}] ${c.detail}`).join("\n");
+  console.log(attempt === 0 ? "생성 호출..." : "하드 모순 → 1회 재생성...");
+  const raw = await callClaude(buildPrompt(retryNote));
+  const d = parseJson(raw, "생성");
+  if (!d || !d.body_md || String(d.body_md).trim().length < 400) { console.error("본문 부실 — 재시도"); continue; }
+  verdict = await verify(String(d.body_md).trim(), String(d.threads_md || THREADS));
+  const hard = verdict.contradictions.filter((c) => c.severity === "hard");
+  console.log(`  연속성: 모순 ${verdict.contradictions.length} (하드 ${hard.length})` + (verdict.contradictions.length ? " — " + verdict.contradictions.map((c) => `[${c.severity}/${c.type}]`).join(" ") : ""));
+  data = d;
+  if (!hard.length) break;
+  if (attempt === 1) console.warn("⚠️ 재생성 후에도 하드 모순 잔존 — 일단 발행하고 로그로 남김(옵시디언/개입으로 보정 권장):\n" + hard.map((c) => `  - [${c.type}] ${c.detail}`).join("\n"));
+}
+if (!data) { console.error("생성 실패"); process.exit(1); }
 
 // ── 회차 .md 저장 ─────────────────────────────────────────────
+const title = String(data.title || `${nextEp}화`).trim();
+const note = String(data.edition_note || "").replaceAll('"', "'").trim();
+const bodyMd = String(data.body_md).trim();
 const heroTitle = title.replace(/^(\d+화)\.?\s*/, "$1 <em>").replace(/$/, "</em>");
-const md = `---
+await writeFile(`${slug}.md`, `---
 title: ${title}
 eyebrow: 웹소설 · 매일 연재
 hero_title: "${heroTitle}"
@@ -246,42 +237,79 @@ summary: ${note}
 ${bodyMd}
 
 </div>
-`;
-await writeFile(`${slug}.md`, md);
+`);
 console.log(`${slug}.md 저장 — ${title} (${bodyMd.length}자)`);
 
-// ── 스토리 바이블 갱신 ────────────────────────────────────────
-if (data.bible && String(data.bible).trim().length > 100) {
-  await writeFile("story-bible.md", String(data.bible).trim() + "\n");
-  console.log("story-bible.md 갱신");
+// ── 런닝 파일 갱신 (전체 덮어쓰기) ────────────────────────────
+if (data.state_md && String(data.state_md).trim().length > 40) await writeFile("state.md", String(data.state_md).trim() + "\n");
+if (data.threads_md && String(data.threads_md).trim().length > 20) await writeFile("canon/threads.md", String(data.threads_md).trim() + "\n");
+
+// 모델이 접두사를 끼워 반환하는 경우 제거(중복 방지)
+const stripSyn = (s) => String(s).trim().replace(/^\d{4}-\d{2}-\d{2}_\d+\s*\([^)]*\)\s*[:：]\s*/, "").replace(/^\d+\s*화\s*[.:：]\s*/, "");
+const stripLog = (s) => String(s).trim().replace(/^\d+\s*화\s*[:：.]\s*/, "");
+
+// ── synopsis 1줄 append ───────────────────────────────────────
+if (data.synopsis_line) {
+  const line = `- **${slug} (${title})**: ${stripSyn(data.synopsis_line)}`;
+  await writeFile("synopsis.md", SYNOPSIS.replace(/\s*$/, "") + "\n" + line + "\n");
 }
 
-// ── 개입 노트 applied 처리 ────────────────────────────────────
-await markApplied(steering.map((s) => s.id), slug);
-if (steering.length) console.log(`개입 ${steering.length}건 applied 처리`);
+// ── 락드 canon: append만 ──────────────────────────────────────
+async function appendBullets(path, items) {
+  const arr = (items || []).map((s) => String(s).trim()).filter(Boolean);
+  if (!arr.length) return;
+  const cur = await readSafe(path);
+  await writeFile(path, cur.replace(/\s*$/, "") + "\n" + arr.map((s) => `- ${s}`).join("\n") + "\n");
+  console.log(`  ${path} +${arr.length}`);
+}
+await appendBullets("canon/world.md", data.world_appends);
+await appendBullets("canon/timeline.md", data.timeline_appends);
+
+// 신규 인물 create (기존과 겹치면 skip)
+const existingNames = new Set(characters.map((c) => c.name));
+for (const nc of data.new_characters || []) {
+  const nm = String(nc?.name || "").trim();
+  if (!nm || existingNames.has(nm) || /[\\/:*?"<>|]/.test(nm)) continue;
+  try { await mkdir("canon/characters", { recursive: true }); } catch {}
+  try { await access(`canon/characters/${nm}.md`); continue; } catch {}
+  await writeFile(`canon/characters/${nm}.md`, String(nc.content || `# ${nm}\n\n## 변화 로그\n`).trim() + "\n");
+  existingNames.add(nm);
+  console.log(`  +인물 ${nm}`);
+}
+// 인물 변화 로그 append (정체 블록 불변)
+for (const cl of data.character_logs || []) {
+  const nm = String(cl?.name || "").trim();
+  const line = String(cl?.line || "").trim();
+  if (!nm || !line || !existingNames.has(nm)) continue;
+  const path = `canon/characters/${nm}.md`;
+  const cur = await readSafe(path);
+  if (!cur) continue;
+  const entry = `- ${nextEp}화: ${stripLog(line)}`;
+  const next = cur.includes("## 변화 로그")
+    ? cur.replace(/\s*$/, "") + "\n" + entry + "\n"
+    : cur.replace(/\s*$/, "") + "\n\n## 변화 로그\n" + entry + "\n";
+  await writeFile(path, next);
+}
+
+// ── 개입 applied ──────────────────────────────────────────────
+await markApplied(steering.map((s) => s.id));
+if (steering.length) console.log(`개입 ${steering.length}건 applied`);
 
 // ── index.md 재생성 ───────────────────────────────────────────
 const files = (await readdir(".")).filter((f) => /^\d{4}-\d{2}-\d{2}_\d+\.md$/.test(f));
-function epNumOf(f) { return parseInt((f.match(/_(\d+)\.md$/) || [])[1] || "0", 10); }
-files.sort((a, b) => epNumOf(b) - epNumOf(a)); // 최신 화 먼저
+const epNumOf = (f) => parseInt((f.match(/_(\d+)\.md$/) || [])[1] || "0", 10);
+files.sort((a, b) => epNumOf(b) - epNumOf(a));
 async function metaOf(file) {
-  try {
-    const fm = (await readFile(file, "utf8")).replace(/\r\n/g, "\n").match(/^---\n([\s\S]*?)\n---/);
-    if (!fm) return { title: file, summary: "" };
-    const t = fm[1].match(/^title:\s*(.+)$/m);
-    const s = fm[1].match(/^summary:\s*(.+)$/m);
-    return { title: t ? t[1].trim() : file, summary: s ? s[1].trim() : "" };
-  } catch { return { title: file, summary: "" }; }
+  const fm = (await readSafe(file)).replace(/\r\n/g, "\n").match(/^---\n([\s\S]*?)\n---/);
+  if (!fm) return { title: file, summary: "" };
+  const t = fm[1].match(/^title:\s*(.+)$/m), s = fm[1].match(/^summary:\s*(.+)$/m);
+  return { title: t ? t[1].trim() : file, summary: s ? s[1].trim() : "" };
 }
-const entries = await Promise.all(
-  files.map(async (f) => {
-    const slugOnly = f.replace(".md", "");
-    const { title: t, summary } = await metaOf(f);
-    return summary ? `- [${t} — ${summary}](${slugOnly}.html)` : `- [${t}](${slugOnly}.html)`;
-  })
-);
-
-const indexMd = `---
+const entries = await Promise.all(files.map(async (f) => {
+  const so = f.replace(".md", ""); const { title: t, summary } = await metaOf(f);
+  return summary ? `- [${t} — ${summary}](${so}.html)` : `- [${t}](${so}.html)`;
+}));
+await writeFile("index.md", `---
 title: 웹소설
 eyebrow: DAILY · WEB NOVEL
 hero_title: "매일 이어지는 <em>웹소설</em>"
@@ -304,7 +332,6 @@ ${entries.join("\n")}
 
 ## 이 연재는
 
-매일 아침, 직전 화와 누적된 설정(스토리 바이블)을 이어받아 다음 화가 자동으로 쓰입니다. Claude Code 구독으로 로컬 생성하므로 별도 API 비용이 없습니다. 독자가 개입하면 그 방향으로, 개입이 없으면 이야기 자체의 흐름대로 흘러갑니다.
-`;
-await writeFile("index.md", indexMd);
+매일 아침, 직전 화와 누적 설정(캐논)을 이어받아 다음 화가 자동으로 쓰입니다. 인물·세계관·타임라인은 락드 캐논으로 고정되고, 매 화 연속성 점검을 거칩니다. 독자가 개입하면 그 방향으로, 없으면 이야기 흐름대로 흘러갑니다.
+`);
 console.log(`index.md 갱신 (${files.length}회차)`);
