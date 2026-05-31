@@ -58,6 +58,19 @@ const lastBody = lastFile ? bodyOf(await readSafe(lastFile)) : "";
 const WORLD = await readSafe("canon/world.md");
 const TIMELINE = await readSafe("canon/timeline.md");
 const PREMISE = await readSafe("canon/premise.md");  // 이 작품의 한 끗(차별점) — 매 화 유지·강화
+const ARC = await readSafe("canon/arc.md");          // 시즌1 100화 아크 — 페이싱·결말 방향
+const SERIES_TITLE = "회귀했는데 고인물이 너무 많다";
+const TARGET = 100;
+const ACT =
+  nextEp <= 20 ? "1막 (생존·자각)" :
+  nextEp <= 45 ? "2막 (세력·구도)" :
+  nextEp <= 65 ? "3막 (반전·상실)" :
+  nextEp <= 85 ? "4막 (진실·결집)" : "5막 (결전·종결)";
+const PACING =
+  nextEp >= 96 ? "최종부: 결말로 수렴. 모든 미해결 떡밥 회수, 신규 떡밥·인물 금지. 100화 완결을 향해." :
+  nextEp >= 86 ? "막바지: 미해결 떡밥 수렴 시작, 신규 인물·설정 최소, 새 대형 떡밥 금지." :
+  nextEp >= 66 ? "후반: 새 대형 떡밥 자제, 열린 떡밥 회수 우선." :
+  "전개: 떡밥을 적절히 깔되 회수 리듬 유지. 막 경계(20/45/65/85화)에서 국면 도약.";
 let charFiles = [];
 try { charFiles = (await readdir("canon/characters")).filter((f) => f.endsWith(".md")); } catch {}
 const characters = [];
@@ -118,6 +131,12 @@ function buildPrompt(retryNote) {
 
 # 🔥 이 작품의 한 끗 — 매 화 반드시 유지·강화 (클리셰 탈출의 핵심)
 ${PREMISE || "(없음)"}
+
+# 📐 아크·페이싱 — 시즌1 100화 (작품: "${SERIES_TITLE}")
+- 현재 **${nextEp}/${TARGET}화 · ${ACT}**
+- 이번 화 페이싱: ${PACING}
+- 아크 비트(결말 '비밀'은 본문에 직접 노출 금지 — 방향만 잡고 복선만):
+${ARC || "(없음)"}
 
 # 🔒 캐논 — 절대 모순 금지 (수정 불가, 읽기 전용)
 ## 타임라인(미래지식)
@@ -353,15 +372,15 @@ const entries = await Promise.all(files.map(async (f) => {
   return summary ? `- [${t} — ${summary}](${so}.html)` : `- [${t}](${so}.html)`;
 }));
 await writeFile("index.md", `---
-title: 웹소설
-eyebrow: DAILY · WEB NOVEL
-hero_title: "매일 이어지는 <em>웹소설</em>"
-description: 매일 아침 한 화씩 자동으로 이어지는 연재 소설입니다. 독자가 방향을 던지면 그대로, 던지지 않으면 흐름대로 흘러갑니다.
+title: ${SERIES_TITLE}
+eyebrow: DAILY · 회귀 헌터물
+hero_title: "${SERIES_TITLE}"
+description: 회귀했는데 나보다 더 굴린 선배 회귀자가 천지다. 미래지식은 매 화 어긋난다. 매일 아침 한 화씩 자동으로 이어지고, 독자가 방향을 던지면 그대로 반영됩니다. (시즌1 전 ${TARGET}화)
 stats:
+  - num: "${files.length}/${TARGET}"
+    lbl: "시즌1 회차"
   - num: "매일"
-    lbl: "Daily Episode"
-  - num: "${files.length}"
-    lbl: "회차"
+    lbl: "Daily 08:30"
   - num: "개입형"
     lbl: "Reader-steered"
 ---

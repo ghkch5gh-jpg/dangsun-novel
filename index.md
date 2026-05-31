@@ -1,13 +1,13 @@
 ---
-title: 웹소설
-eyebrow: DAILY · WEB NOVEL
-hero_title: "매일 이어지는 <em>웹소설</em>"
-description: 매일 아침 한 화씩 자동으로 이어지는 연재 소설입니다. 독자가 방향을 던지면 그대로, 던지지 않으면 흐름대로 흘러갑니다.
+title: 회귀했는데 고인물이 너무 많다
+eyebrow: DAILY · 회귀 헌터물
+hero_title: "회귀했는데 고인물이 너무 많다"
+description: 회귀했는데 나보다 더 굴린 선배 회귀자가 천지다. 미래지식은 매 화 어긋난다. 매일 아침 한 화씩 자동으로 이어지고, 독자가 방향을 던지면 그대로 반영됩니다. (시즌1 전 100화)
 stats:
+  - num: "5/100"
+    lbl: "시즌1 회차"
   - num: "매일"
-    lbl: "Daily Episode"
-  - num: "5"
-    lbl: "회차"
+    lbl: "Daily 08:30"
   - num: "개입형"
     lbl: "Reader-steered"
 ---
