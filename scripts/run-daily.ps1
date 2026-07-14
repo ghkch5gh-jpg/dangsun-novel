@@ -2,7 +2,7 @@
 # ASCII-only: repo가 한글 경로 아래 있어 Desktop을 환경에서 해석.
 $ErrorActionPreference = 'Continue'
 
-# 작업 스케줄러는 최소 PATH로 실행 — node/git/claude 경로 명시.
+# 작업 스케줄러는 최소 PATH로 실행 — node/git/codex 경로 명시.
 $env:Path = "C:\Program Files\nodejs;C:\Program Files\Git\cmd;C:\Users\myh43\AppData\Roaming\npm;$env:Path"
 
 # repo 루트 = 이 스크립트(repo\scripts\run-daily.ps1)의 부모의 부모.
