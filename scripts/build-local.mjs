@@ -192,7 +192,9 @@ ${STYLE}
 console.log(`회차: ${nextEp}화 (${slug}) · 개입 ${steering.length}건 · 인물 ${characters.length} · Codex ${CODEX_MODEL || "default"}/${CODEX_REASONING_EFFORT}`);
 const prompt0 = buildPrompt("");
 console.log(`Prompt: ${(Buffer.byteLength(prompt0, "utf8") / 1024).toFixed(1)} KB`);
-if (DRY_RUN) { console.log("=== DRY RUN ===\n" + prompt0.slice(0, 3500) + `\n...(전체 ${prompt0.length}자)`); process.exit(0); }
+if (DRY_RUN) {
+  console.log("=== DRY RUN ===\n" + prompt0.slice(0, 3500) + `\n...(전체 ${prompt0.length}자)`);
+} else {
 
 // ── Codex 비대화식 호출 ───────────────────────────────────────
 function callCodex(promptText) {
@@ -424,3 +426,4 @@ ${entries.join("\n")}
 매일 아침, 직전 화와 누적 설정(캐논)을 이어받아 다음 화가 자동으로 쓰입니다. 인물·세계관·타임라인은 락드 캐논으로 고정되고, 매 화 연속성 점검을 거칩니다. 독자가 개입하면 그 방향으로, 없으면 이야기 흐름대로 흘러갑니다.
 `);
 console.log(`index.md 갱신 (${files.length}회차)`);
+}
